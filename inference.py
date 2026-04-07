@@ -34,7 +34,6 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BENCHMARK = "customer_support_triage"
-FALLBACK_ENV_BASE_URL = "https://rahulxdadwal-customer-support-triage-openenv.hf.space"
 TASKS = [
     task.strip()
     for task in os.getenv(
@@ -305,15 +304,6 @@ async def create_env() -> CustomerSupportTriageEnv:
         except Exception as exc:
             _debug(
                 f"Local Docker image startup failed for '{LOCAL_IMAGE_NAME}', "
-                f"falling back to local environment: {exc}"
-            )
-
-    if FALLBACK_ENV_BASE_URL:
-        try:
-            return CustomerSupportTriageEnv(base_url=FALLBACK_ENV_BASE_URL)
-        except Exception as exc:
-            _debug(
-                f"Hosted Space client setup failed for '{FALLBACK_ENV_BASE_URL}', "
                 f"falling back to local environment: {exc}"
             )
 
