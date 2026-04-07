@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import textwrap
+from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
@@ -18,13 +20,21 @@ except ModuleNotFoundError:
     from client import CustomerSupportTriageEnv
     from models import CustomerSupportTriageAction
 
+try:
+    from customer_support_triage.server.customer_support_triage_environment import (
+        CustomerSupportTriageEnvironment,
+    )
+except ModuleNotFoundError:
+    from server.customer_support_triage_environment import CustomerSupportTriageEnvironment
 
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BENCHMARK = "customer_support_triage"
+FALLBACK_ENV_BASE_URL = "https://rahulxdadwal-customer-support-triage-openenv.hf.space"
 TASKS = [
     task.strip()
     for task in os.getenv(
@@ -75,6 +85,10 @@ def _single_line(value: str | None) -> str:
     if value is None:
         return "null"
     return " ".join(str(value).split())
+
+
+def _debug(message: str) -> None:
+    print(f"[DEBUG] {message}", file=sys.stderr, flush=True)
 
 
 def build_user_prompt(observation: Any) -> str:
@@ -249,25 +263,86 @@ def action_to_log_string(action: CustomerSupportTriageAction) -> str:
     )
 
 
+@dataclass
+class LocalStepResult:
+    observation: Any
+    reward: float | None
+    done: bool
+
+
+class LocalEnvAdapter:
+    def __init__(self) -> None:
+        self._env = CustomerSupportTriageEnvironment()
+
+    async def reset(self, **kwargs: Any) -> LocalStepResult:
+        observation = self._env.reset(**kwargs)
+        return LocalStepResult(
+            observation=observation,
+            reward=observation.reward,
+            done=observation.done,
+        )
+
+    async def step(self, action: CustomerSupportTriageAction, **kwargs: Any) -> LocalStepResult:
+        del kwargs
+        observation = self._env.step(action)
+        return LocalStepResult(
+            observation=observation,
+            reward=observation.reward,
+            done=observation.done,
+        )
+
+    async def close(self) -> None:
+        self._env.close()
+
+
+async def create_env() -> CustomerSupportTriageEnv:
+    if ENV_BASE_URL:
+        return CustomerSupportTriageEnv(base_url=ENV_BASE_URL)
+
+    if LOCAL_IMAGE_NAME:
+        try:
+            return await CustomerSupportTriageEnv.from_docker_image(LOCAL_IMAGE_NAME)
+        except Exception as exc:
+            _debug(
+                f"Local Docker image startup failed for '{LOCAL_IMAGE_NAME}', "
+                f"falling back to local environment: {exc}"
+            )
+
+    if FALLBACK_ENV_BASE_URL:
+        try:
+            return CustomerSupportTriageEnv(base_url=FALLBACK_ENV_BASE_URL)
+        except Exception as exc:
+            _debug(
+                f"Hosted Space client setup failed for '{FALLBACK_ENV_BASE_URL}', "
+                f"falling back to local environment: {exc}"
+            )
+
+    return LocalEnvAdapter()
+
+
 async def run_task(task_name: str) -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN) if HF_TOKEN else None
-    if ENV_BASE_URL:
-        env = CustomerSupportTriageEnv(base_url=ENV_BASE_URL)
-    else:
-        if not LOCAL_IMAGE_NAME:
-            raise RuntimeError(
-                "LOCAL_IMAGE_NAME must be set when ENV_BASE_URL is not provided."
-            )
-        env = await CustomerSupportTriageEnv.from_docker_image(LOCAL_IMAGE_NAME)
     rewards: list[float] = []
     score = 0.0
     steps_taken = 0
     success = False
+    env: CustomerSupportTriageEnv | None = None
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = await env.reset(task_name=task_name)
+        env = await create_env()
+        try:
+            result = await env.reset(task_name=task_name)
+        except Exception as exc:
+            _debug(f"Primary environment path failed for '{task_name}': {exc}")
+            if env is not None:
+                try:
+                    await env.close()
+                except Exception as close_exc:
+                    _debug(f"env.close() error during fallback: {close_exc}")
+            env = LocalEnvAdapter()
+            result = await env.reset(task_name=task_name)
 
         for step in range(1, MAX_STEPS + 1):
             if result.done:
@@ -295,9 +370,14 @@ async def run_task(task_name: str) -> None:
 
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
+    except Exception as exc:
+        _debug(f"Task '{task_name}' failed: {exc}")
     finally:
         try:
-            await env.close()
+            if env is not None:
+                await env.close()
+        except Exception as exc:
+            _debug(f"env.close() error: {exc}")
         finally:
             log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
